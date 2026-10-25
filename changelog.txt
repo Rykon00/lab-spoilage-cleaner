@@ -1,0 +1,14 @@
+---------------------------------------------------------------------------------------------------
+Version: 1.0.0
+Date: 25. 10. 2026
+  Features:
+    - Initial release.
+    - Empties the lab trash (where science packs that spoil inside a lab leave their spoilage) and takes items the lab cannot use out of its input slots.
+    - Mode "Robots pick it up" (default): the items are dropped next to the lab and marked for deconstruction, construction robots carry them to a storage chest. Only for labs inside a construction area, nothing is dropped elsewhere.
+    - Mode "Directly into the logistic network": the items go straight into the logistic network the lab stands in.
+    - Labs on space platforms put their spoilage into the platform hub (setting, default on).
+    - Labs are checked in turns, spread over the check interval (setting, default 2 seconds).
+    - Console command /lsc-clean cleans every lab right now.
+    - English and German locale.
+  Info:
+    - Added a thumbnail (vanilla icons): lab, spoilage and a construction robot carrying it away.

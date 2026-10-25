@@ -1,0 +1,158 @@
+name: Weekly check and auto-port
+
+# Weekly on Fridays (and by hand) against the latest stable headless Factorio:
+# - Same minor version as info.json's factorio_version: load check (+ functional tests in
+#   tests/functional-test); on failure one issue (label load-check).
+# - Newer minor version (e.g. 2.2 while the mod says 2.1): automatic port. tools/port.py sets
+#   factorio_version and the dependencies on built-in mods to the new minor, bumps the mod version
+#   (1.4.2 -> 1.5.0) and writes the changelog section. If the load check and the functional tests pass
+#   against the new version, the workflow commits to main, tags v<version>, creates the GitHub release
+#   and calls release.yml, which uploads the zip to the mod portal. If they fail, nothing is committed
+#   and one issue (label auto-port) gets the report, so the port has to be done by hand.
+# "dry_run" (manual runs) does everything except commit, tag, release and upload.
+
+on:
+  schedule:
+    # Fridays 15:00 German time (Factorio releases usually come out on Fridays).
+    - cron: "0 15 * * 5"
+      timezone: "Europe/Berlin"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Port and test, but do not commit, tag, release or upload
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  issues: write
+
+env:
+  # Runs of tools/load_check.py: "plain" = base only, "space-age" = with every built-in mod.
+  LOAD_CHECK_MODES: "plain space-age"
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.publish.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download the latest stable headless Factorio
+        id: factorio
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/factorio.tar.xz" https://factorio.com/get-download/stable/headless/linux64
+          tar -xJf "$RUNNER_TEMP/factorio.tar.xz" -C "$RUNNER_TEMP"
+          version=$("$RUNNER_TEMP/factorio/bin/x64/factorio" --version | sed -n 's/^Version: \([0-9.]*\).*/\1/p' | head -1)
+          minor=${version%.*}
+          mod_minor=$(python3 -c 'import json; print(json.load(open("info.json"))["factorio_version"])')
+          newer=$(python3 -c 'import sys; a, b = (tuple(map(int, v.split("."))) for v in sys.argv[1:]); print("true" if a > b else "false")' "$minor" "$mod_minor")
+          echo "Factorio $version, mod factorio_version $mod_minor, newer minor: $newer"
+          {
+            echo "version=$version"
+            echo "minor=$minor"
+            echo "mod_minor=$mod_minor"
+            echo "newer=$newer"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Port to Factorio ${{ steps.factorio.outputs.minor }}
+        id: port
+        if: steps.factorio.outputs.newer == 'true'
+        run: |
+          version=$(python3 tools/port.py --minor "${{ steps.factorio.outputs.minor }}")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Ported to ${{ steps.factorio.outputs.minor }}, new mod version $version"
+          git diff
+
+      - name: Build the mod zip
+        id: build
+        run: echo "zip=$(python3 tools/build.py)" >> "$GITHUB_OUTPUT"
+
+      - name: Load check and functional tests
+        id: check
+        continue-on-error: true
+        run: |
+          modes=""
+          for m in $LOAD_CHECK_MODES; do modes="$modes --mode $m"; done
+          tests=""
+          if [ -d tests/functional-test ]; then tests="--test-mod tests/functional-test"; fi
+          python3 tools/load_check.py --factorio "$RUNNER_TEMP/factorio/bin/x64/factorio" \
+            --zip "${{ steps.build.outputs.zip }}" $modes $tests \
+            --work "$RUNNER_TEMP/load-check" --summary "$RUNNER_TEMP/summary.md"
+
+      - name: Job summary
+        if: always()
+        run: cat "$RUNNER_TEMP/summary.md" >> "$GITHUB_STEP_SUMMARY" || true
+
+      - name: Commit, tag and create the release
+        id: publish
+        if: >-
+          steps.port.outcome == 'success' && steps.check.outcome == 'success' &&
+          !(github.event_name == 'workflow_dispatch' && inputs.dry_run)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.port.outputs.version }}
+          MINOR: ${{ steps.factorio.outputs.minor }}
+        run: |
+          tag="v$VERSION"
+          python3 tools/build.py --check-release "$tag"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add info.json changelog.txt
+          git commit -m "Port to Factorio $MINOR (version $VERSION)" \
+            -m "Automatic port by the weekly workflow: factorio_version and the dependencies on built-in mods set to $MINOR; load check and functional tests passed against Factorio ${{ steps.factorio.outputs.version }}."
+          git tag "$tag"
+          git push origin "HEAD:${{ github.event.repository.default_branch }}" "$tag"
+          python3 tools/build.py --notes "$VERSION" > "$RUNNER_TEMP/notes.md"
+          gh release create "$tag" --verify-tag --title "$tag" --notes-file "$RUNNER_TEMP/notes.md"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Open an issue on failure
+        if: steps.check.outcome == 'failure' && !(github.event_name == 'workflow_dispatch' && inputs.dry_run)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.factorio.outputs.version }}
+          MINOR: ${{ steps.factorio.outputs.minor }}
+          NEWER: ${{ steps.factorio.outputs.newer }}
+        run: |
+          mod=$(python3 -c 'import json; print(json.load(open("info.json"))["name"])')
+          if [ "$NEWER" = "true" ]; then
+            label=auto-port
+            title="Factorio $MINOR released: automatic port of $mod failed"
+            intro="The automatic port to Factorio $MINOR did not pass the load check or the functional tests, so nothing was committed or released. Port the mod by hand."
+          else
+            label=load-check
+            title="Factorio $VERSION: $mod fails to load"
+            intro="The weekly load check against Factorio $VERSION failed."
+          fi
+          open=$(gh issue list --label "$label" --state open --json number --jq length 2>/dev/null || echo 0)
+          if [ "$open" != "0" ]; then
+            echo "An issue with label $label is already open, not opening another one."
+            exit 0
+          fi
+          {
+            echo "$intro"
+            echo
+            cat "$RUNNER_TEMP/summary.md" 2>/dev/null || echo "The load check did not write a report."
+            echo
+            echo "Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          } > "$RUNNER_TEMP/issue.md"
+          gh label create "$label" --color B60205 --description "Opened by the weekly workflow" --force
+          gh issue create --title "$title" --label "$label" --body-file "$RUNNER_TEMP/issue.md"
+
+      - name: Fail if the load check failed
+        if: steps.check.outcome == 'failure'
+        run: exit 1
+
+  release:
+    needs: check
+    if: needs.check.outputs.tag != ''
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ needs.check.outputs.tag }}
+    secrets: inherit

@@ -1,0 +1,11 @@
+{
+  "name": "lab-spoilage-cleaner",
+  "version": "1.0.0",
+  "title": "Lab Spoilage Cleaner",
+  "author": "rykon_",
+  "factorio_version": "2.1",
+  "dependencies": [
+    "base >= 2.1.0"
+  ],
+  "description": "Takes spoilage and other unusable items out of labs. Construction robots carry it to storage chests (or it goes straight into the logistic network). Labs on space platforms empty into the hub."
+}

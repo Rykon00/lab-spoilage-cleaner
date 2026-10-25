@@ -1,0 +1,104 @@
+name: Release
+
+# Runs when a GitHub release is published by hand, and is called by port.yml after an automatic
+# port (a release made by a workflow's GITHUB_TOKEN does not trigger other workflows).
+
+on:
+  release:
+    types: [published]
+  workflow_call:
+    inputs:
+      tag:
+        description: Release tag (v<version>) to build, attach and upload
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  LOAD_CHECK_MODES: "plain space-age"
+  TAG: ${{ inputs.tag || github.event.release.tag_name }}
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.event.release.tag_name }}
+
+      - name: Check tag, info.json version and changelog
+        run: python3 tools/build.py --check-release "$TAG"
+
+      - name: Build the mod zip
+        id: build
+        run: echo "zip=$(python3 tools/build.py)" >> "$GITHUB_OUTPUT"
+
+      - name: Load check against the latest stable headless Factorio
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/factorio.tar.xz" https://factorio.com/get-download/stable/headless/linux64
+          tar -xJf "$RUNNER_TEMP/factorio.tar.xz" -C "$RUNNER_TEMP"
+          modes=""
+          for m in $LOAD_CHECK_MODES; do modes="$modes --mode $m"; done
+          tests=""
+          if [ -d tests/functional-test ]; then tests="--test-mod tests/functional-test"; fi
+          python3 tools/load_check.py --factorio "$RUNNER_TEMP/factorio/bin/x64/factorio" \
+            --zip "${{ steps.build.outputs.zip }}" $modes $tests --work "$RUNNER_TEMP/load-check"
+
+      - name: Attach the zip to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$TAG" "${{ steps.build.outputs.zip }}" --clobber
+
+      - name: Upload to the Factorio mod portal
+        env:
+          FACTORIO_API_KEY: ${{ secrets.FACTORIO_API_KEY }}
+          ZIP: ${{ steps.build.outputs.zip }}
+          # Only used when the mod is published for the first time (see the Mod publish API).
+          PORTAL_CATEGORY: tweaks
+          PORTAL_LICENSE: default_mit
+        run: |
+          if [ -z "$FACTORIO_API_KEY" ]; then
+            echo "::error::Repository secret FACTORIO_API_KEY is not set."
+            exit 1
+          fi
+          mod=$(python3 -c 'import json; print(json.load(open("info.json"))["name"])')
+          json_field() { python3 -c 'import json,sys; print(json.load(sys.stdin).get(sys.argv[1], ""))' "$1" 2>/dev/null; }
+
+          # New release of a mod that is already on the portal (needs "ModPortal: Upload Mods").
+          init=$(curl -sS -X POST \
+            -H "Authorization: Bearer $FACTORIO_API_KEY" \
+            -F "mod=$mod" \
+            https://mods.factorio.com/api/v2/mods/releases/init_upload)
+          upload_url=$(printf '%s' "$init" | json_field upload_url)
+          error=$(printf '%s' "$init" | json_field error)
+          extra=()
+
+          if [ -z "$upload_url" ] && [ "$error" = "UnknownMod" ]; then
+            # First release: the mod does not exist on the portal yet (needs "ModPortal: Publish Mods").
+            echo "Mod $mod is not on the portal yet, publishing it."
+            init=$(curl -sS -X POST \
+              -H "Authorization: Bearer $FACTORIO_API_KEY" \
+              -F "mod=$mod" \
+              https://mods.factorio.com/api/v2/mods/init_publish)
+            upload_url=$(printf '%s' "$init" | json_field upload_url)
+            # Portal description: README.md without the "## Build" section.
+            python3 - > "$RUNNER_TEMP/description.md" <<'PY'
+          import re
+          text = open("README.md", encoding="utf-8").read()
+          print(re.split(r"^## Build\b", text, flags=re.M)[0].rstrip())
+          PY
+            extra=(-F "description=<$RUNNER_TEMP/description.md"
+                   -F "category=$PORTAL_CATEGORY"
+                   -F "license=$PORTAL_LICENSE"
+                   -F "source_url=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY")
+          fi
+
+          if [ -z "$upload_url" ]; then
+            echo "::error::Mod portal returned no upload_url: $init"
+            exit 1
+          fi
+          result=$(curl -sS -X POST -F "file=@$ZIP" "${extra[@]}" "$upload_url")
+          echo "$result"
+          printf '%s' "$result" | python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin).get("success") else 1)'

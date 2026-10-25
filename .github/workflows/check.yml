@@ -1,0 +1,47 @@
+name: Load check
+
+# On every push and pull request: build the mod and load it (plus the functional tests in
+# tests/functional-test, if the folder exists) in the latest stable headless Factorio.
+# The weekly run against new Factorio versions (and the automatic port) is in port.yml.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Runs of tools/load_check.py: "plain" = base only, "space-age" = with every built-in mod.
+  LOAD_CHECK_MODES: "plain space-age"
+
+jobs:
+  load-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download the latest stable headless Factorio
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/factorio.tar.xz" https://factorio.com/get-download/stable/headless/linux64
+          tar -xJf "$RUNNER_TEMP/factorio.tar.xz" -C "$RUNNER_TEMP"
+          "$RUNNER_TEMP/factorio/bin/x64/factorio" --version
+
+      - name: Build the mod zip
+        id: build
+        run: echo "zip=$(python3 tools/build.py)" >> "$GITHUB_OUTPUT"
+
+      - name: Load check
+        run: |
+          modes=""
+          for m in $LOAD_CHECK_MODES; do modes="$modes --mode $m"; done
+          tests=""
+          if [ -d tests/functional-test ]; then tests="--test-mod tests/functional-test"; fi
+          python3 tools/load_check.py --factorio "$RUNNER_TEMP/factorio/bin/x64/factorio" \
+            --zip "${{ steps.build.outputs.zip }}" $modes $tests \
+            --work "$RUNNER_TEMP/load-check" --summary "$RUNNER_TEMP/summary.md"
+
+      - name: Job summary
+        if: always()
+        run: cat "$RUNNER_TEMP/summary.md" >> "$GITHUB_STEP_SUMMARY" || true
